@@ -6,7 +6,7 @@ Indexer and real-time API backed by PostgreSQL
 ```bash
 docker compose up -d     # Postgres on 127.0.0.1:5432
 export DATABASE_URL=postgres://pouw:pouw@localhost:5432/pouw_indexer
-cargo run                # migrations, then the API on 0.0.0.0:8000 (BIND_ADDR), /health
+cargo run &              # migrations, then the API on 0.0.0.0:8000 (BIND_ADDR), /health
 cargo run -- seed        # load tests/fixtures/blocks.borsh.jsonl
 ./pre_push_tests.sh      # fmt, clippy, tests
 ```
@@ -16,7 +16,7 @@ The code also supports `.env` file. This means it you can, alternatively, put th
 
 ```bash
 docker compose up -d     # Postgres on 127.0.0.1:5432
-cargo run                # migrations, then the API on 0.0.0.0:8000 (BIND_ADDR), /health
+cargo run &              # migrations, then the API on 0.0.0.0:8000 (BIND_ADDR), /health
 cargo run -- seed        # load tests/fixtures/blocks.borsh.jsonl
 ./pre_push_tests.sh      # fmt, clippy, tests
 ```
