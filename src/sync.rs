@@ -295,6 +295,7 @@ mod tests {
     }
 
     /// `n` empty blocks after `parent`.
+    #[allow(clippy::explicit_counter_loop)]
     fn extend(parent: &Block, n: u64, salt: u64) -> Vec<Block> {
         let mut out: Vec<Block> = Vec::new();
         let mut prev = parent.header.hash();
