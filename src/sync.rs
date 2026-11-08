@@ -98,7 +98,7 @@ async fn reorganise<N: NodeClient>(
             .await?
             .into_iter()
             .next()
-            .map(|b| b.header.hash());
+            .map(|b| b.id.hash().0);
         if let Some(same) = ours.filter(|o| Some(*o) == theirs) {
             break (h, same);
         }
@@ -163,23 +163,23 @@ pub async fn sync_step<N: NodeClient>(
 
     // The page must be one unbroken chain, and must continue from our checkpoint.
     for (i, b) in blocks.iter().enumerate() {
-        if b.header.height != next + i as u64 {
+        if b.header.height.get() != next + i as u64 {
             bail!(
                 "the node returned height {} where {} was expected",
-                b.header.height,
+                b.header.height.get(),
                 next + i as u64
             );
         }
-        if i > 0 && b.header.prev_hash != blocks[i - 1].header.hash() {
+        if i > 0 && b.header.parent.hash().0 != blocks[i - 1].id.hash().0 {
             bail!(
                 "block {} does not point at block {}",
-                b.header.height,
-                b.header.height - 1
+                b.header.height.get(),
+                b.header.height.get() - 1
             );
         }
     }
     // the page must continue from our checkpoint block, otherwise the node's chain changed
-    if let Some((h, _)) = checkpoint.filter(|(_, hash)| blocks[0].header.prev_hash != *hash) {
+    if let Some((h, _)) = checkpoint.filter(|(_, hash)| blocks[0].header.parent.hash().0 != *hash) {
         return reorganise(pool, node, cfg, m, h, head.height).await;
     }
 
@@ -195,17 +195,17 @@ pub async fn sync_step<N: NodeClient>(
     save_checkpoint(
         &mut tx,
         &cfg.node_id,
-        last.header.height,
-        &last.header.hash(),
+        last.header.height.get(),
+        &last.id.hash().0,
     )
     .await?;
     tx.commit().await?;
 
     m.batch_seconds.observe(started.elapsed().as_secs_f64());
     m.blocks_written.inc_by(added);
-    m.indexed_height.set(last.header.height as i64);
+    m.indexed_height.set(last.header.height.get() as i64);
     m.lag_blocks
-        .set(head.height as i64 - last.header.height as i64);
+        .set(head.height as i64 - last.header.height.get() as i64);
     Ok(Progress::Advanced {
         blocks: blocks.len(),
     })
@@ -258,55 +258,15 @@ pub async fn run<N: NodeClient>(pool: PgPool, node: N, cfg: SyncConfig, m: Arc<M
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::{Block, BlockHeader};
-    use crate::fixtures::read_blocks;
+    use crate::fakechain::{ChainBuilder, demo_chain};
     use crate::node::MemoryNode;
-
-    const FIXTURES: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/blocks.borsh.jsonl"
-    );
+    use pouw_api::view::BlockView;
 
     fn cfg() -> SyncConfig {
         SyncConfig {
             node_id: "test-node".into(),
             poll: Duration::from_millis(10),
         }
-    }
-
-    /// A block with no transactions on top of `prev`. `salt` makes branches differ.
-    fn empty_block(height: u64, prev: [u8; 32], salt: u64) -> Block {
-        Block {
-            header: BlockHeader {
-                version: 1,
-                height,
-                prev_hash: prev,
-                timestamp: 1_800_000_000 + height * 5 + salt,
-                miner: [7; 32],
-                difficulty: 1000 + salt,
-                bucket_count: 8,
-                bucket_id: 0,
-                tx_count: 0,
-                tx_root: [0; 32],
-            },
-            txs: vec![],
-            proof_txs: vec![],
-        }
-    }
-
-    /// `n` empty blocks after `parent`.
-    #[allow(clippy::explicit_counter_loop)]
-    fn extend(parent: &Block, n: u64, salt: u64) -> Vec<Block> {
-        let mut out: Vec<Block> = Vec::new();
-        let mut prev = parent.header.hash();
-        let mut height = parent.header.height + 1;
-        for _ in 0..n {
-            let b = empty_block(height, prev, salt);
-            prev = b.header.hash();
-            height += 1;
-            out.push(b);
-        }
-        out
     }
 
     async fn count(pool: &PgPool, sql: &str) -> i64 {
@@ -320,13 +280,24 @@ mod tests {
             .unwrap()
     }
 
-    fn hashes(chain: &[Block]) -> Vec<Vec<u8>> {
-        chain.iter().map(|b| b.header.hash().to_vec()).collect()
+    fn hashes(chain: &[BlockView]) -> Vec<Vec<u8>> {
+        chain.iter().map(|b| b.id.hash().0.to_vec()).collect()
+    }
+
+    /// Two branches that share blocks 0..=10: `a` has 20 blocks, `b` has 14 (blocks 11..=13 differ).
+    fn two_branches() -> (Vec<BlockView>, Vec<BlockView>) {
+        let mut builder = ChainBuilder::new(42);
+        let mut a = builder.take(11);
+        let mut rival = builder.reseeded(7);
+        a.extend(builder.take(9));
+        let mut b = a[..=10].to_vec();
+        b.extend(rival.take(3));
+        (a, b)
     }
 
     #[sqlx::test]
     async fn restart_in_the_middle_does_not_duplicate(pool: PgPool) {
-        let chain = read_blocks(FIXTURES).unwrap();
+        let chain = demo_chain(20);
         let node = MemoryNode::new(chain[..7].to_vec());
         let m = Metrics::new();
         sync_until_caught_up(&pool, &node, &cfg(), &m)
@@ -353,10 +324,8 @@ mod tests {
 
     #[sqlx::test]
     async fn the_database_follows_a_reorganisation_and_back(pool: PgPool) {
-        let a = read_blocks(FIXTURES).unwrap(); // heights 0..=19
-        // branch b shares blocks 0..=10 with a, then has 3 other blocks (11..=13)
-        let mut b = a[..=10].to_vec();
-        b.extend(extend(&a[10], 3, 1));
+        let (a, b) = two_branches();
+        assert_eq!((a.len(), b.len()), (20, 14));
         let node = MemoryNode::new(a.clone());
         let m = Metrics::new();
 
@@ -388,10 +357,14 @@ mod tests {
             .await,
             9
         );
-        let tx_in_orphans: i64 = a[11..].iter().map(|x| x.proof_txs.len() as i64).sum();
+        let in_orphans: i64 = a[11..].iter().map(|x| x.proof_txs.len() as i64).sum();
         assert_eq!(
-            count(&pool, "SELECT count(*) FROM proof_txs p JOIN blocks bl ON bl.hash = p.block_hash WHERE NOT bl.canonical").await,
-            tx_in_orphans
+            count(
+                &pool,
+                "SELECT count(*) FROM proof_txs p JOIN blocks bl ON bl.hash = p.block_hash WHERE NOT bl.canonical"
+            )
+            .await,
+            in_orphans
         );
         assert_eq!(count(&pool, "SELECT height FROM sync_state").await, 13);
         let text = m.render();
@@ -413,7 +386,7 @@ mod tests {
 
     #[sqlx::test]
     async fn a_shorter_node_chain_orphans_the_extra_blocks(pool: PgPool) {
-        let a = read_blocks(FIXTURES).unwrap();
+        let a = demo_chain(20);
         let node = MemoryNode::new(a.clone());
         let m = Metrics::new();
         sync_until_caught_up(&pool, &node, &cfg(), &m)
@@ -433,10 +406,7 @@ mod tests {
 
     #[sqlx::test]
     async fn ten_thousand_blocks_are_written_fast(pool: PgPool) {
-        let genesis = empty_block(0, [0; 32], 0);
-        let mut chain = vec![genesis.clone()];
-        chain.extend(extend(&genesis, 9_999, 0));
-        let node = MemoryNode::new(chain);
+        let node = MemoryNode::new(ChainBuilder::new(1).take_empty(10_000));
         let m = Metrics::new();
 
         let started = Instant::now();

@@ -1,6 +1,9 @@
 //! Prometheus metrics of the indexer, served as text on /metrics.
 
-use prometheus::{Encoder, Histogram, HistogramOpts, IntCounter, IntGauge, Registry, TextEncoder};
+use prometheus::{
+    Encoder, Histogram, HistogramOpts, IntCounter, IntGauge, IntGaugeVec, Opts, Registry,
+    TextEncoder,
+};
 
 pub struct Metrics {
     registry: Registry,
@@ -12,6 +15,14 @@ pub struct Metrics {
     pub last_reorg_depth: IntGauge,
     pub node_errors: IntCounter,
     pub batch_seconds: Histogram,
+    pub events_ingested: IntCounter,
+    pub events_unparsed: IntCounter,
+    pub event_gaps: IntCounter,
+    pub event_source_errors: IntCounter,
+    /// last stored event seq, per node
+    pub event_cursor: IntGaugeVec,
+    /// 1 while a node is read with plain polling because long polling kept failing
+    pub event_polling_mode: IntGaugeVec,
 }
 
 impl Metrics {
@@ -40,7 +51,33 @@ impl Metrics {
         registry
             .register(Box::new(batch_seconds.clone()))
             .expect("register");
+        let gauge_vec = |name: &str, help: &str| {
+            let g = IntGaugeVec::new(Opts::new(name, help), &["node_id"]).expect("valid metric");
+            registry.register(Box::new(g.clone())).expect("register");
+            g
+        };
         Self {
+            events_ingested: counter("pouw_indexer_events_ingested_total", "Node events stored"),
+            events_unparsed: counter(
+                "pouw_indexer_events_unparsed_total",
+                "Events kept raw because their content was not understood",
+            ),
+            event_gaps: counter(
+                "pouw_indexer_event_gaps_total",
+                "Ranges of events a node no longer had",
+            ),
+            event_source_errors: counter(
+                "pouw_indexer_event_source_errors_total",
+                "Failed requests for events",
+            ),
+            event_cursor: gauge_vec(
+                "pouw_indexer_event_cursor",
+                "Last stored event seq of a node",
+            ),
+            event_polling_mode: gauge_vec(
+                "pouw_indexer_event_polling_mode",
+                "1 while a node is read with plain polling",
+            ),
             indexed_height: gauge(
                 "pouw_indexer_indexed_height",
                 "Height of the last block in the database",
