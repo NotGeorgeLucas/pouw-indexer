@@ -1,65 +1,54 @@
-//! What the indexer needs from a node: its head and ranges of blocks, as the node API serves
-//! them (`pouw_api::view`). A real HTTP client and an in-memory node for tests and local runs.
+//! What the indexer needs from a node: its head, ranges of blocks and accounts, as the node API
+//! serves them (`pouw_api::view`). A real HTTP client and an in-memory node for tests.
 
+use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, anyhow, bail};
-use pouw_api::view::{BlockView, BlocksPage, HeaderView};
+use pouw_api::view::{AccountView, BlockView, BlocksPage, HeaderView};
+use pouw_types::crypto::Address;
+use pouw_types::{Amount, Nonce};
+
+use crate::error::NodeError;
+use crate::store::Hash;
 
 /// The node's current chain tip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Head {
     pub height: u64,
-    pub hash: [u8; 32],
+    pub hash: Hash,
 }
 
 /// The node API serves at most this many blocks per call.
 pub const MAX_BLOCKS_PER_CALL: usize = pouw_api::view::MAX_BLOCKS_PER_CALL as usize;
 
-pub trait NodeClient: Send + Sync {
+pub trait NodeClient: Send {
     /// Tip of the node's canonical chain.
-    fn head(&self) -> impl Future<Output = anyhow::Result<Head>> + Send;
+    fn head(&mut self) -> impl Future<Output = Result<Head, NodeError>> + Send;
     /// Canonical blocks with `from <= height <= to`, in height order, at most
     /// `MAX_BLOCKS_PER_CALL`. Heights the node does not have are left out.
     fn blocks(
-        &self,
+        &mut self,
         from: u64,
         to: u64,
-    ) -> impl Future<Output = anyhow::Result<Vec<BlockView>>> + Send;
-}
-
-pub fn read_block_views(path: &str) -> anyhow::Result<Vec<BlockView>> {
-    let text = std::fs::read_to_string(path).with_context(|| format!("cannot read {path}"))?;
-    text.lines()
-        .enumerate()
-        .filter(|(_, l)| !l.trim().is_empty())
-        .map(|(i, l)| {
-            serde_json::from_str(l).with_context(|| format!("{path} line {}: not a block", i + 1))
-        })
-        .collect()
-}
-
-pub fn write_block_views(path: &str, blocks: &[BlockView]) -> anyhow::Result<()> {
-    let mut out = String::new();
-    for b in blocks {
-        out.push_str(&serde_json::to_string(b)?);
-        out.push('\n');
-    }
-    std::fs::write(path, out).with_context(|| format!("cannot write {path}"))
+    ) -> impl Future<Output = Result<Vec<BlockView>, NodeError>> + Send;
+    /// Balance and nonce of an address, `None` for an address the chain has not seen.
+    fn account(
+        &mut self,
+        address: Hash,
+    ) -> impl Future<Output = Result<Option<AccountView>, NodeError>> + Send;
 }
 
 // ------------------------------------------------------------------------------ real client
 
-/// The node's REST API (`GET /v1/blocks/head`, `GET /v1/blocks?from=&to=`).
+/// The node's REST API (`GET /v1/blocks/head`, `/v1/blocks?from=&to=`, `/v1/accounts/{addr}`).
 pub struct HttpNode {
     client: reqwest::Client,
     base: String,
 }
 
 impl HttpNode {
-    pub fn new(base_url: &str) -> anyhow::Result<Self> {
+    pub fn new(base_url: &str) -> Result<Self, NodeError> {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(60))
@@ -70,117 +59,143 @@ impl HttpNode {
         })
     }
 
-    async fn get<T: serde::de::DeserializeOwned>(
-        &self,
-        path: &str,
-        query: &[(&str, u64)],
-    ) -> anyhow::Result<T> {
-        let resp = self
+    async fn get(&self, path: &str, query: &[(&str, u64)]) -> Result<reqwest::Response, NodeError> {
+        Ok(self
             .client
             .get(format!("{}{path}", self.base))
             .query(query)
             .send()
-            .await
-            .with_context(|| format!("GET {path} failed"))?;
+            .await?)
+    }
+
+    /// The answer if it is a success, otherwise the status and body as an error.
+    async fn expect_ok(
+        resp: reqwest::Response,
+        path: &str,
+    ) -> Result<reqwest::Response, NodeError> {
         let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            bail!("GET {path}: the node answered {status}: {body}");
+        if status.is_success() {
+            return Ok(resp);
         }
-        resp.json()
-            .await
-            .with_context(|| format!("GET {path}: the answer is not the expected JSON"))
+        let body = resp.text().await.unwrap_or_default();
+        Err(NodeError::Status {
+            path: path.to_string(),
+            status: status.as_u16(),
+            body,
+        })
     }
 }
 
 impl NodeClient for HttpNode {
-    async fn head(&self) -> anyhow::Result<Head> {
-        let h: HeaderView = self.get(pouw_api::path::HEAD, &[]).await?;
+    async fn head(&mut self) -> Result<Head, NodeError> {
+        let path = pouw_api::path::HEAD;
+        let resp = Self::expect_ok(self.get(path, &[]).await?, path).await?;
+        let h: HeaderView = resp.json().await?;
         Ok(Head {
             height: h.header.height.get(),
             hash: h.id.hash().0,
         })
     }
 
-    async fn blocks(&self, from: u64, to: u64) -> anyhow::Result<Vec<BlockView>> {
-        let page: BlocksPage = self
-            .get(pouw_api::path::BLOCKS, &[("from", from), ("to", to)])
-            .await?;
+    async fn blocks(&mut self, from: u64, to: u64) -> Result<Vec<BlockView>, NodeError> {
+        let path = pouw_api::path::BLOCKS;
+        let resp =
+            Self::expect_ok(self.get(path, &[("from", from), ("to", to)]).await?, path).await?;
+        let page: BlocksPage = resp.json().await?;
         Ok(page.blocks)
+    }
+
+    async fn account(&mut self, address: Hash) -> Result<Option<AccountView>, NodeError> {
+        let path = pouw_api::path::ACCOUNT.replace("{addr}", &Address(address).to_string());
+        let resp = self.get(&path, &[]).await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Ok(Some(Self::expect_ok(resp, &path).await?.json().await?))
     }
 }
 
 // ------------------------------------------------------------------------------ in memory
 
-/// A node that lives in memory. `set_chain` swaps the whole chain, which is how tests
-/// simulate a reorganisation. `from_file` serves a file of blocks, for running the indexer
-/// without a node.
-#[derive(Clone, Default)]
+/// A node that lives in memory, for tests and for running without a node. `set_chain` swaps the
+/// whole chain, which is how tests simulate a reorganisation.
+#[derive(Default)]
 pub struct MemoryNode {
-    chain: Arc<Mutex<Vec<BlockView>>>,
+    chain: Vec<BlockView>,
+    accounts: HashMap<Hash, (u64, u64)>,
 }
 
-// Parts of this are only used by tests and by local runs with NODE_FIXTURES.
+// Parts of this are only used by tests.
 #[allow(dead_code)]
 impl MemoryNode {
     pub fn new(chain: Vec<BlockView>) -> Self {
         Self {
-            chain: Arc::new(Mutex::new(chain)),
+            chain,
+            accounts: HashMap::new(),
         }
     }
 
-    pub fn from_file(path: &str) -> anyhow::Result<Self> {
-        Ok(Self::new(read_block_views(path)?))
+    pub fn set_chain(&mut self, chain: Vec<BlockView>) {
+        self.chain = chain;
     }
 
-    pub fn set_chain(&self, chain: Vec<BlockView>) {
-        *self.chain.lock().expect("lock") = chain;
+    /// What `GET /v1/accounts/{addr}` answers for this address.
+    pub fn set_account(&mut self, address: Hash, balance: u64, nonce: u64) {
+        self.accounts.insert(address, (balance, nonce));
     }
 }
 
 impl NodeClient for MemoryNode {
-    async fn head(&self) -> anyhow::Result<Head> {
-        let chain = self.chain.lock().expect("lock");
-        let last = chain
-            .last()
-            .ok_or_else(|| anyhow!("the node has no blocks"))?;
+    async fn head(&mut self) -> Result<Head, NodeError> {
+        let last = self.chain.last().ok_or(NodeError::NoBlocks)?;
         Ok(Head {
             height: last.header.height.get(),
             hash: last.id.hash().0,
         })
     }
 
-    async fn blocks(&self, from: u64, to: u64) -> anyhow::Result<Vec<BlockView>> {
-        let chain = self.chain.lock().expect("lock");
-        Ok(chain
+    async fn blocks(&mut self, from: u64, to: u64) -> Result<Vec<BlockView>, NodeError> {
+        Ok(self
+            .chain
             .iter()
             .filter(|b| (from..=to).contains(&b.header.height.get()))
             .take(MAX_BLOCKS_PER_CALL)
             .cloned()
             .collect())
     }
+
+    async fn account(&mut self, address: Hash) -> Result<Option<AccountView>, NodeError> {
+        Ok(self
+            .accounts
+            .get(&address)
+            .map(|&(balance, nonce)| AccountView {
+                address: Address(address),
+                balance: Amount(balance),
+                nonce: Nonce(nonce),
+            }))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
-    use axum::{
-        Json, Router,
-        extract::{Query, State},
-        routing::get,
-    };
-    use sqlx::PgPool;
+    use axum::extract::{Path, Query, State};
+    use axum::http::StatusCode;
+    use axum::routing::get;
+    use axum::{Json, Router};
 
     use super::*;
     use crate::fakechain::ChainBuilder;
     use crate::metrics::Metrics;
+    use crate::store::Store;
     use crate::sync::{SyncConfig, sync_until_caught_up};
 
     type Chain = Arc<Vec<BlockView>>;
 
-    /// Serve a chain like the node API does: `/v1/blocks/head` and `/v1/blocks?from=&to=` (max 100).
-    async fn serve(chain: Vec<BlockView>) -> String {
+    /// Serve a chain like the node API does: head, blocks (max 100 per call) and one account.
+    async fn serve(chain: Vec<BlockView>, known: Hash) -> String {
         async fn head(State(c): State<Chain>) -> Json<HeaderView> {
             let b = c.last().expect("not empty");
             Json(HeaderView {
@@ -201,10 +216,25 @@ mod tests {
                 .collect();
             Json(BlocksPage { blocks })
         }
+        async fn account(
+            State(known): State<Hash>,
+            Path(addr): Path<String>,
+        ) -> Result<Json<AccountView>, StatusCode> {
+            if addr == Address(known).to_string() {
+                Ok(Json(AccountView {
+                    address: Address(known),
+                    balance: Amount(500),
+                    nonce: Nonce(3),
+                }))
+            } else {
+                Err(StatusCode::NOT_FOUND)
+            }
+        }
         let app = Router::new()
             .route("/v1/blocks/head", get(head))
             .route("/v1/blocks", get(blocks))
-            .with_state(Arc::new(chain));
+            .with_state(Arc::new(chain))
+            .route("/v1/accounts/{addr}", get(account).with_state(known));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -212,28 +242,38 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn the_http_node_is_followed_over_several_pages(pool: PgPool) {
+    async fn the_http_node_is_followed_over_several_pages(pool: sqlx::PgPool) {
         // 250 blocks need three requests of at most 100
         let chain = ChainBuilder::new(5).take_empty(250);
-        let url = serve(chain.clone()).await;
-        let node = HttpNode::new(&url).unwrap();
+        let url = serve(chain.clone(), [9; 32]).await;
+        let mut node = HttpNode::new(&url).unwrap();
 
         let head = node.head().await.unwrap();
         assert_eq!((head.height, head.hash), (249, chain[249].id.hash().0));
         assert_eq!(node.blocks(0, 1000).await.unwrap().len(), 100);
 
+        let store = Store::new(pool);
         let cfg = SyncConfig {
-            node_id: "http".into(),
+            node: "http".parse().unwrap(),
             poll: Duration::from_millis(10),
         };
-        sync_until_caught_up(&pool, &node, &cfg, &Metrics::new())
+        sync_until_caught_up(&store, &mut node, &cfg, &Metrics::new())
             .await
             .unwrap();
         let n: i64 = sqlx::query_scalar("SELECT count(*) FROM blocks WHERE canonical")
-            .fetch_one(&pool)
+            .fetch_one(store.pool())
             .await
             .unwrap();
         assert_eq!(n, 250);
+    }
+
+    #[tokio::test]
+    async fn accounts_are_read_and_an_unknown_address_is_none() {
+        let url = serve(ChainBuilder::new(5).take_empty(3), [9; 32]).await;
+        let mut node = HttpNode::new(&url).unwrap();
+        let a = node.account([9; 32]).await.unwrap().expect("known address");
+        assert_eq!((a.balance.0, a.nonce.0), (500, 3));
+        assert!(node.account([8; 32]).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -242,6 +282,14 @@ mod tests {
             let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             format!("http://{}", l.local_addr().unwrap())
         };
-        assert!(HttpNode::new(&dead).unwrap().head().await.is_err());
+        assert!(matches!(
+            HttpNode::new(&dead).unwrap().head().await,
+            Err(NodeError::Request(_))
+        ));
+    }
+
+    #[test]
+    fn an_address_is_written_with_its_prefix_in_the_url() {
+        assert!(Address([1; 32]).to_string().starts_with("addr:"));
     }
 }

@@ -14,16 +14,18 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, anyhow, bail};
+use pouw_api::event::NodeId;
 use serde::Deserialize;
-use sqlx::{PgConnection, PgPool};
+use tracing::{error, info, warn};
 
+use crate::error::{BadEvent, EventError, StoreError};
 use crate::event_source::{Event, EventSource, FetchError};
 use crate::metrics::Metrics;
+use crate::store::{self, Parsed, Store};
 
 pub struct EventConfig {
-    /// The `node_id` this source must report. It is also the key of the cursor.
-    pub node_id: String,
+    /// The node whose events these are. Events that name another node are refused.
+    pub node: NodeId,
     /// Events asked per request (the node's maximum is 1000).
     pub page: u32,
     /// How long a long-poll request may be held by the node.
@@ -39,9 +41,9 @@ pub struct EventConfig {
 }
 
 impl EventConfig {
-    pub fn new(node_id: &str) -> Self {
+    pub fn new(node: NodeId) -> Self {
         Self {
-            node_id: node_id.to_string(),
+            node,
             page: 1000,
             long_poll_ms: 20_000,
             poll_interval: Duration::from_secs(2),
@@ -53,27 +55,35 @@ impl EventConfig {
     }
 }
 
+impl From<serde_json::Error> for BadEvent {
+    fn from(e: serde_json::Error) -> Self {
+        Self(e.to_string())
+    }
+}
+
 // ------------------------------------------------------------------------------ parsing
 
-fn hex_id(s: &str, prefix: &str) -> anyhow::Result<[u8; 32]> {
+fn hex_id(s: &str, prefix: &str) -> Result<[u8; 32], BadEvent> {
     let h = s
         .strip_prefix(prefix)
-        .with_context(|| format!("{s:?} does not start with {prefix:?}"))?;
-    let v = hex::decode(h).with_context(|| format!("{s:?} is not hex"))?;
-    v.try_into().map_err(|_| anyhow!("{s:?} is not 32 bytes"))
+        .ok_or_else(|| BadEvent(format!("{s:?} does not start with {prefix:?}")))?;
+    let v = hex::decode(h).map_err(|_| BadEvent(format!("{s:?} is not hex")))?;
+    v.try_into()
+        .map_err(|_| BadEvent(format!("{s:?} is not 32 bytes")))
 }
 
 /// A field element: "0x" and 62 hex digits (31 bytes).
-fn field_element(s: &str) -> anyhow::Result<[u8; 31]> {
+fn field_element(s: &str) -> Result<[u8; 31], BadEvent> {
     let h = s
         .strip_prefix("0x")
-        .with_context(|| format!("{s:?} does not start with 0x"))?;
-    let v = hex::decode(h).with_context(|| format!("{s:?} is not hex"))?;
-    v.try_into().map_err(|_| anyhow!("{s:?} is not 31 bytes"))
+        .ok_or_else(|| BadEvent(format!("{s:?} does not start with 0x")))?;
+    let v = hex::decode(h).map_err(|_| BadEvent(format!("{s:?} is not hex")))?;
+    v.try_into()
+        .map_err(|_| BadEvent(format!("{s:?} is not 31 bytes")))
 }
 
-fn int(v: u64) -> anyhow::Result<i64> {
-    i64::try_from(v).context("number does not fit in a Postgres BIGINT")
+fn int(v: u64) -> Result<i64, BadEvent> {
+    i64::try_from(v).map_err(|_| BadEvent(format!("{v} does not fit in a Postgres BIGINT")))
 }
 
 #[derive(Deserialize)]
@@ -149,73 +159,7 @@ struct MempoolSnapshot {
     by_circuit: serde_json::Value,
 }
 
-/// An event turned into database-ready values. Building it checks everything (id lengths,
-/// numbers that fit), so a bad event is caught here and never fails the SQL.
-enum Parsed {
-    TxReceived {
-        txid: [u8; 32],
-        kind: String,
-        sender: [u8; 32],
-        fee: i64,
-    },
-    TxRejected {
-        txid: Option<[u8; 32]>,
-        reason: String,
-        message: String,
-    },
-    ProofProduced {
-        txid_text: String,
-        txid: [u8; 32],
-        circuit: [u8; 32],
-        system: String,
-        prove_ms: i64,
-        proof_hash: [u8; 32],
-    },
-    Lottery {
-        txid: [u8; 32],
-        proof_hash: [u8; 32],
-        circuit: [u8; 32],
-        won: bool,
-        eta: [u8; 31],
-        mask: [u8; 31],
-        counter: i64,
-    },
-    BlockReceived {
-        hash: [u8; 32],
-        height: i64,
-        from_peer: String,
-    },
-    BlockVerified {
-        hash: [u8; 32],
-        height: i64,
-        verify_ms: i64,
-        proofs: i64,
-        ok: bool,
-    },
-    BlockAccepted {
-        hash: [u8; 32],
-        height: i64,
-    },
-    BlockRejected {
-        hash: [u8; 32],
-        height: Option<i64>,
-        reason: String,
-    },
-    BlockOrphaned {
-        hash: [u8; 32],
-        height: i64,
-    },
-    Snapshot {
-        pending_txs: i64,
-        pending_requests: i64,
-        by_circuit: serde_json::Value,
-    },
-    /// Kept only in node_events: proof_request_started, proof_verified, peer_*, node_started,
-    /// and any kind this version does not know.
-    RawOnly,
-}
-
-fn parse(ev: &Event) -> anyhow::Result<Parsed> {
+fn parse(ev: &Event) -> Result<Parsed, BadEvent> {
     let d = ev.data.clone();
     Ok(match ev.kind.as_str() {
         "tx_received" => {
@@ -224,7 +168,7 @@ fn parse(ev: &Event) -> anyhow::Result<Parsed> {
                 t.tx_kind.as_str(),
                 "transfer" | "proof_request" | "register_circuit"
             ) {
-                bail!("unknown tx_kind {:?}", t.tx_kind);
+                return Err(BadEvent(format!("unknown tx_kind {:?}", t.tx_kind)));
             }
             Parsed::TxReceived {
                 txid: hex_id(&t.txid, "tx:")?,
@@ -317,189 +261,7 @@ fn parse(ev: &Event) -> anyhow::Result<Parsed> {
     })
 }
 
-// ------------------------------------------------------------------------------ writing
-
-async fn apply(conn: &mut PgConnection, node: &str, ev: &Event, p: &Parsed) -> sqlx::Result<()> {
-    let t = ev.time.as_str();
-    match p {
-        Parsed::TxReceived {
-            txid,
-            kind,
-            sender,
-            fee,
-        } => {
-            sqlx::query(
-                "INSERT INTO tx_observations (node_id, txid, tx_kind, sender, fee, received_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6::timestamptz) ON CONFLICT (node_id, txid) DO NOTHING",
-            )
-            .bind(node).bind(&txid[..]).bind(kind).bind(&sender[..]).bind(fee).bind(t)
-            .execute(&mut *conn).await?;
-        }
-        Parsed::TxRejected {
-            txid,
-            reason,
-            message,
-        } => {
-            sqlx::query(
-                "INSERT INTO tx_rejections (node_id, seq, txid, reason_code, message, rejected_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6::timestamptz) ON CONFLICT (node_id, seq) DO NOTHING",
-            )
-            .bind(node).bind(ev.seq as i64).bind(txid.as_ref().map(|x| x.to_vec())).bind(reason).bind(message).bind(t)
-            .execute(&mut *conn).await?;
-        }
-        Parsed::ProofProduced {
-            txid_text,
-            txid,
-            circuit,
-            system,
-            prove_ms,
-            proof_hash,
-        } => {
-            // started_at: the proof_request_started this node logged earlier for the same request
-            sqlx::query(
-                "INSERT INTO proof_attempts (node_id, proof_hash, request_txid, circuit_id, proof_system, \
-                     started_at, produced_at, prove_ms) \
-                 VALUES ($1, $2, $3, $4, $5, \
-                     (SELECT e.time FROM node_events e WHERE e.node_id = $1 AND e.kind = 'proof_request_started' \
-                        AND e.data ->> 'txid' = $8 AND e.seq < $9 ORDER BY e.seq DESC LIMIT 1), \
-                     $6::timestamptz, $7) \
-                 ON CONFLICT (node_id, proof_hash) DO UPDATE SET request_txid = EXCLUDED.request_txid, \
-                     circuit_id = EXCLUDED.circuit_id, proof_system = EXCLUDED.proof_system, \
-                     started_at = COALESCE(proof_attempts.started_at, EXCLUDED.started_at), \
-                     produced_at = EXCLUDED.produced_at, prove_ms = EXCLUDED.prove_ms",
-            )
-            .bind(node).bind(&proof_hash[..]).bind(&txid[..]).bind(&circuit[..]).bind(system)
-            .bind(t).bind(prove_ms).bind(txid_text).bind(ev.seq as i64)
-            .execute(&mut *conn).await?;
-        }
-        Parsed::Lottery {
-            txid,
-            proof_hash,
-            circuit,
-            won,
-            eta,
-            mask,
-            counter,
-        } => {
-            sqlx::query(
-                "INSERT INTO proof_attempts (node_id, proof_hash, request_txid, circuit_id, won, eta, mask, usage_counter) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
-                 ON CONFLICT (node_id, proof_hash) DO UPDATE SET won = EXCLUDED.won, eta = EXCLUDED.eta, \
-                     mask = EXCLUDED.mask, usage_counter = EXCLUDED.usage_counter",
-            )
-            .bind(node).bind(&proof_hash[..]).bind(&txid[..]).bind(&circuit[..]).bind(won)
-            .bind(&eta[..]).bind(&mask[..]).bind(counter)
-            .execute(&mut *conn).await?;
-        }
-        Parsed::BlockReceived {
-            hash,
-            height,
-            from_peer,
-        } => {
-            sqlx::query(
-                "INSERT INTO block_observations (node_id, block_hash, height, received_at, from_peer) \
-                 VALUES ($1, $2, $3, $4::timestamptz, $5) \
-                 ON CONFLICT (node_id, block_hash) DO UPDATE SET height = EXCLUDED.height, \
-                     received_at = COALESCE(block_observations.received_at, EXCLUDED.received_at), \
-                     from_peer = COALESCE(block_observations.from_peer, EXCLUDED.from_peer)",
-            )
-            .bind(node).bind(&hash[..]).bind(height).bind(t).bind(from_peer)
-            .execute(&mut *conn).await?;
-        }
-        Parsed::BlockVerified {
-            hash,
-            height,
-            verify_ms,
-            proofs,
-            ok,
-        } => {
-            sqlx::query(
-                "INSERT INTO block_observations (node_id, block_hash, height, verified_at, verify_ms, verified_ok, verified_proofs) \
-                 VALUES ($1, $2, $3, $4::timestamptz, $5, $6, $7) \
-                 ON CONFLICT (node_id, block_hash) DO UPDATE SET height = EXCLUDED.height, \
-                     verified_at = EXCLUDED.verified_at, verify_ms = EXCLUDED.verify_ms, \
-                     verified_ok = EXCLUDED.verified_ok, verified_proofs = EXCLUDED.verified_proofs",
-            )
-            .bind(node).bind(&hash[..]).bind(height).bind(t).bind(verify_ms).bind(ok).bind(proofs)
-            .execute(&mut *conn).await?;
-        }
-        Parsed::BlockAccepted { hash, height } => {
-            // accepted again after an orphaning: the block is part of the chain once more
-            sqlx::query(
-                "INSERT INTO block_observations (node_id, block_hash, height, accepted_at) \
-                 VALUES ($1, $2, $3, $4::timestamptz) \
-                 ON CONFLICT (node_id, block_hash) DO UPDATE SET height = EXCLUDED.height, \
-                     accepted_at = EXCLUDED.accepted_at, orphaned_at = NULL",
-            )
-            .bind(node)
-            .bind(&hash[..])
-            .bind(height)
-            .bind(t)
-            .execute(&mut *conn)
-            .await?;
-        }
-        Parsed::BlockRejected {
-            hash,
-            height,
-            reason,
-        } => {
-            sqlx::query(
-                "INSERT INTO block_observations (node_id, block_hash, height, rejected_at, reject_reason) \
-                 VALUES ($1, $2, $3, $4::timestamptz, $5) \
-                 ON CONFLICT (node_id, block_hash) DO UPDATE SET \
-                     height = COALESCE(EXCLUDED.height, block_observations.height), \
-                     rejected_at = EXCLUDED.rejected_at, reject_reason = EXCLUDED.reject_reason",
-            )
-            .bind(node).bind(&hash[..]).bind(height).bind(t).bind(reason)
-            .execute(&mut *conn).await?;
-        }
-        Parsed::BlockOrphaned { hash, height } => {
-            sqlx::query(
-                "INSERT INTO block_observations (node_id, block_hash, height, orphaned_at) \
-                 VALUES ($1, $2, $3, $4::timestamptz) \
-                 ON CONFLICT (node_id, block_hash) DO UPDATE SET height = EXCLUDED.height, orphaned_at = EXCLUDED.orphaned_at",
-            )
-            .bind(node).bind(&hash[..]).bind(height).bind(t)
-            .execute(&mut *conn).await?;
-        }
-        Parsed::Snapshot {
-            pending_txs,
-            pending_requests,
-            by_circuit,
-        } => {
-            sqlx::query(
-                "INSERT INTO mempool_snapshots (node_id, observed_at, pending_txs, pending_proof_requests, by_circuit) \
-                 VALUES ($1, $2::timestamptz, $3, $4, $5) ON CONFLICT DO NOTHING",
-            )
-            .bind(node).bind(t).bind(pending_txs).bind(pending_requests).bind(by_circuit)
-            .execute(&mut *conn).await?;
-        }
-        Parsed::RawOnly => {}
-    }
-    Ok(())
-}
-
-async fn set_cursor(conn: &mut PgConnection, node: &str, seq: u64) -> sqlx::Result<()> {
-    // GREATEST: the cursor never moves back, even if a page is replayed
-    sqlx::query(
-        "INSERT INTO ingest_cursors (node_id, last_seq) VALUES ($1, $2) \
-         ON CONFLICT (node_id) DO UPDATE SET last_seq = GREATEST(ingest_cursors.last_seq, EXCLUDED.last_seq)",
-    )
-    .bind(node)
-    .bind(seq as i64)
-    .execute(&mut *conn)
-    .await?;
-    Ok(())
-}
-
-pub async fn load_cursor(pool: &PgPool, node: &str) -> anyhow::Result<u64> {
-    let v: Option<i64> =
-        sqlx::query_scalar("SELECT last_seq FROM ingest_cursors WHERE node_id = $1")
-            .bind(node)
-            .fetch_optional(pool)
-            .await?;
-    Ok(v.unwrap_or(0) as u64)
-}
+// ------------------------------------------------------------------------------ one page
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct PageStats {
@@ -510,76 +272,56 @@ pub struct PageStats {
 
 /// Store a page that must continue right after `after`: seq after+1, after+2, ...
 /// Safe to call again with the same events.
-pub async fn store_page(
-    pool: &PgPool,
-    node: &str,
+pub async fn ingest_page(
+    store: &Store,
+    node: &NodeId,
     after: u64,
     events: &[Event],
-) -> anyhow::Result<PageStats> {
+) -> Result<PageStats, EventError> {
     for (i, e) in events.iter().enumerate() {
         let want = after + 1 + i as u64;
         if e.seq != want {
-            bail!(
-                "{node}: expected event {want} but got {} (a node must not skip or repeat)",
+            return Err(EventError::Contract(format!(
+                "{node}: expected event {want} but got {}",
                 e.seq
-            );
+            )));
         }
-        if e.node_id != node {
-            bail!(
+        if e.node_id != node.as_str() {
+            return Err(EventError::Contract(format!(
                 "{node}: got an event of node {:?}, is the source address right?",
                 e.node_id
-            );
+            )));
         }
         if e.time.len() < 20 || !e.time.ends_with('Z') || !e.time.contains('T') {
-            bail!(
+            return Err(EventError::Contract(format!(
                 "{node}: event {} has a time that is not RFC 3339 UTC: {:?}",
-                e.seq,
-                e.time
-            );
+                e.seq, e.time
+            )));
         }
     }
     let Some(last) = events.last() else {
         return Ok(PageStats { stored: 0, bad: 0 });
     };
 
-    let mut tx = pool.begin().await?;
-    // 1. the events as received, many rows in one statement
-    let seqs: Vec<i64> = events.iter().map(|e| e.seq as i64).collect();
-    let times: Vec<&str> = events.iter().map(|e| e.time.as_str()).collect();
-    let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
-    let data: Vec<String> = events.iter().map(|e| e.data.to_string()).collect();
-    sqlx::query(
-        "INSERT INTO node_events (node_id, seq, time, kind, data) \
-         SELECT $1, u.s, u.t::timestamptz, u.k, u.d::jsonb \
-         FROM UNNEST($2::bigint[], $3::text[], $4::text[], $5::text[]) AS u(s, t, k, d) \
-         ON CONFLICT (node_id, seq) DO NOTHING",
-    )
-    .bind(node)
-    .bind(&seqs)
-    .bind(&times)
-    .bind(&kinds)
-    .bind(&data)
-    .execute(&mut *tx)
-    .await?;
-
-    // 2. the typed rows
+    let mut tx = store.begin().await?;
+    store::insert_events(&mut tx, node, events).await?;
     let mut bad = 0;
     for e in events {
         match parse(e) {
-            Ok(p) => apply(&mut tx, node, e, &p).await?,
+            Ok(p) => store::apply_event(&mut tx, node, e, &p).await?,
             Err(err) => {
                 bad += 1;
-                eprintln!(
-                    "events: {node} seq {} ({}): kept raw, not understood: {err:#}",
-                    e.seq, e.kind
+                warn!(
+                    node = node.as_str(),
+                    seq = e.seq,
+                    kind = e.kind,
+                    "kept raw, not understood: {err}"
                 );
             }
         }
     }
-
-    // 3. the cursor, in the same transaction
-    set_cursor(&mut tx, node, last.seq).await?;
-    tx.commit().await?;
+    store::set_event_cursor(&mut tx, node, last.seq).await?;
+    tx.commit().await.map_err(StoreError::from)?;
     Ok(PageStats {
         stored: events.len(),
         bad,
@@ -600,25 +342,26 @@ pub enum Step {
 
 /// Ask once (after the cursor) and store what comes back.
 pub async fn ingest_step<S: EventSource>(
-    pool: &PgPool,
-    src: &S,
+    store: &Store,
+    src: &mut S,
     cfg: &EventConfig,
     m: &Metrics,
     wait_ms: u32,
-) -> anyhow::Result<Step> {
-    let cursor = load_cursor(pool, &cfg.node_id).await?;
+) -> Result<Step, EventError> {
+    let gauge = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+    let cursor = store.event_cursor(&cfg.node).await?;
     m.event_cursor
-        .with_label_values(&[&cfg.node_id])
-        .set(cursor as i64);
+        .with_label_values(&[cfg.node.as_str()])
+        .set(gauge(cursor));
     match src.fetch(cursor, cfg.page, wait_ms).await {
         Ok(page) if page.events.is_empty() => Ok(Step::Empty),
         Ok(page) => {
-            let stats = store_page(pool, &cfg.node_id, cursor, &page.events).await?;
+            let stats = ingest_page(store, &cfg.node, cursor, &page.events).await?;
             m.events_ingested.inc_by(stats.stored as u64);
             m.events_unparsed.inc_by(stats.bad as u64);
             m.event_cursor
-                .with_label_values(&[&cfg.node_id])
-                .set((cursor + stats.stored as u64) as i64);
+                .with_label_values(&[cfg.node.as_str()])
+                .set(gauge(cursor + stats.stored as u64));
             Ok(Step::Stored(stats.stored))
         }
         Err(FetchError::CursorExpired { oldest_seq }) => {
@@ -627,38 +370,37 @@ pub async fn ingest_step<S: EventSource>(
             let from = cursor + 1;
             let to = oldest_seq.saturating_sub(1);
             if to < from {
-                bail!("the node says cursor {cursor} expired but its oldest event is {oldest_seq}");
+                return Err(EventError::Contract(format!(
+                    "the node says cursor {cursor} expired but its oldest event is {oldest_seq}"
+                )));
             }
-            let mut tx = pool.begin().await?;
-            sqlx::query("INSERT INTO event_gaps (node_id, from_seq, to_seq) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
-                .bind(&cfg.node_id)
-                .bind(from as i64)
-                .bind(to as i64)
-                .execute(&mut *tx)
-                .await?;
-            set_cursor(&mut tx, &cfg.node_id, to).await?;
-            tx.commit().await?;
+            let mut tx = store.begin().await?;
+            store::record_event_gap(&mut tx, &cfg.node, from, to).await?;
+            store::set_event_cursor(&mut tx, &cfg.node, to).await?;
+            tx.commit().await.map_err(StoreError::from)?;
             m.event_gaps.inc();
             Ok(Step::Gap { from, to })
         }
-        Err(FetchError::Other(e)) => Err(e),
+        Err(FetchError::Node(e)) => Err(e.into()),
     }
 }
 
-/// Keep asking until the node has nothing new.
+/// Keep asking until the node has nothing new (used by tests).
 #[allow(dead_code)]
 pub async fn ingest_until_caught_up<S: EventSource>(
-    pool: &PgPool,
-    src: &S,
+    store: &Store,
+    src: &mut S,
     cfg: &EventConfig,
     m: &Metrics,
-) -> anyhow::Result<()> {
+) -> Result<(), EventError> {
     for _ in 0..100_000 {
-        if ingest_step(pool, src, cfg, m, 0).await? == Step::Empty {
+        if ingest_step(store, src, cfg, m, 0).await? == Step::Empty {
             return Ok(());
         }
     }
-    bail!("event ingestion did not settle")
+    Err(EventError::Contract(
+        "event ingestion did not settle".into(),
+    ))
 }
 
 // ------------------------------------------------------------------------------ the loop
@@ -677,7 +419,8 @@ enum Mode {
 /// `fallback_after` failures in a row it switches to plain polling, and goes back to long
 /// polling after `recover_after` good polls. The cursor lives in the database, so every
 /// retry continues exactly where the last stored page ended.
-pub async fn run<S: EventSource>(pool: PgPool, src: S, cfg: EventConfig, m: Arc<Metrics>) {
+pub async fn run<S: EventSource>(store: Store, mut src: S, cfg: EventConfig, m: Arc<Metrics>) {
+    let node = cfg.node.as_str();
     let mut mode = Mode::LongPoll;
     let (mut failures, mut good_polls) = (0u32, 0u32);
     loop {
@@ -687,27 +430,22 @@ pub async fn run<S: EventSource>(pool: PgPool, src: S, cfg: EventConfig, m: Arc<
         } else {
             0
         };
-        match ingest_step(&pool, &src, &cfg, &m, wait_ms).await {
+        match ingest_step(&store, &mut src, &cfg, &m, wait_ms).await {
             Ok(step) => {
                 failures = 0;
                 if let Step::Gap { from, to } = step {
-                    eprintln!(
-                        "events: {}: the node no longer had events {from}..={to}, recorded as a gap",
-                        cfg.node_id
+                    warn!(
+                        node,
+                        from, to, "the node no longer had these events, recorded as a gap"
                     );
                 }
                 if mode == Mode::Poll {
                     good_polls += 1;
                     if good_polls >= cfg.recover_after {
-                        println!(
-                            "events: {}: connection is stable, back to long polling",
-                            cfg.node_id
-                        );
+                        info!(node, "connection is stable, back to long polling");
                         mode = Mode::LongPoll;
                         good_polls = 0;
-                        m.event_polling_mode
-                            .with_label_values(&[&cfg.node_id])
-                            .set(0);
+                        m.event_polling_mode.with_label_values(&[node]).set(0);
                     }
                 }
                 if step == Step::Empty {
@@ -718,19 +456,25 @@ pub async fn run<S: EventSource>(pool: PgPool, src: S, cfg: EventConfig, m: Arc<
                 }
             }
             Err(e) => {
-                m.event_source_errors.inc();
                 failures += 1;
                 good_polls = 0;
-                eprintln!("events: {} (failure {failures}): {e:#}", cfg.node_id);
+                if matches!(
+                    e,
+                    EventError::Store(StoreError::Db(_) | StoreError::Migrate(_))
+                ) {
+                    m.store_errors.inc();
+                    error!(node, failures, "database fault: {e}");
+                } else {
+                    m.event_source_errors.inc();
+                    warn!(node, failures, "{e}");
+                }
                 if failures >= cfg.fallback_after && mode == Mode::LongPoll {
-                    println!(
-                        "events: {}: {failures} failures in a row, switching to plain polling",
-                        cfg.node_id
+                    warn!(
+                        node,
+                        failures, "failures in a row, switching to plain polling"
                     );
                     mode = Mode::Poll;
-                    m.event_polling_mode
-                        .with_label_values(&[&cfg.node_id])
-                        .set(1);
+                    m.event_polling_mode.with_label_values(&[node]).set(1);
                 }
                 let pause = cfg
                     .backoff_base
@@ -747,7 +491,9 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     use super::*;
-    use crate::event_source::{EventSource, HttpEventSource, MemoryEventNode, read_events};
+    use crate::error::NodeError;
+    use crate::event_source::{HttpEventSource, MemoryEventNode};
+    use crate::fixtures::read_events;
 
     /// A recorded stream of the miner (it has proofs, lottery results and block events).
     const MINER_1: &str = concat!(
@@ -755,17 +501,24 @@ mod tests {
         "/mock_data/pouw-fixtures/events/miner-1.jsonl"
     );
 
+    fn id(s: &str) -> NodeId {
+        s.parse().unwrap()
+    }
+
     fn fast_cfg(node: &str) -> EventConfig {
         EventConfig {
             poll_interval: Duration::from_millis(5),
             backoff_base: Duration::from_millis(2),
             backoff_max: Duration::from_millis(20),
-            ..EventConfig::new(node)
+            ..EventConfig::new(id(node))
         }
     }
 
-    async fn count(pool: &PgPool, sql: &str) -> i64 {
-        sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
+    async fn count(store: &Store, sql: &str) -> i64 {
+        sqlx::query_scalar(sql)
+            .fetch_one(store.pool())
+            .await
+            .unwrap()
     }
 
     fn kind_count(events: &[Event], kind: &str) -> i64 {
@@ -773,43 +526,44 @@ mod tests {
     }
 
     /// seq 1..=n, each exactly once
-    async fn assert_no_gaps_no_duplicates(pool: &PgPool, node: &str, n: i64) {
+    async fn assert_no_gaps_no_duplicates(store: &Store, node: &str, n: i64) {
         let row: (i64, i64, i64, i64) = sqlx::query_as(
             "SELECT count(*), count(DISTINCT seq), min(seq), max(seq) FROM node_events WHERE node_id = $1",
         )
         .bind(node)
-        .fetch_one(pool)
+        .fetch_one(store.pool())
         .await
         .unwrap();
         assert_eq!(row, (n, n, 1, n));
-        assert_eq!(load_cursor(pool, node).await.unwrap() as i64, n);
+        assert_eq!(store.event_cursor(&id(node)).await.unwrap() as i64, n);
     }
 
     #[sqlx::test]
-    async fn the_recorded_stream_is_stored_in_every_table(pool: PgPool) {
+    async fn the_recorded_stream_is_stored_in_every_table(pool: sqlx::PgPool) {
+        let store = Store::new(pool);
         let events = read_events(MINER_1).unwrap();
         let n = events.len() as i64;
-        let node = MemoryEventNode::new(events.clone());
+        let mut node = MemoryEventNode::new(events.clone());
         let m = Metrics::new();
-        ingest_until_caught_up(&pool, &node, &fast_cfg("miner-1"), &m)
+        ingest_until_caught_up(&store, &mut node, &fast_cfg("miner-1"), &m)
             .await
             .unwrap();
 
-        assert_no_gaps_no_duplicates(&pool, "miner-1", n).await;
+        assert_no_gaps_no_duplicates(&store, "miner-1", n).await;
         assert_eq!(
-            count(&pool, "SELECT count(*) FROM tx_observations").await,
+            count(&store, "SELECT count(*) FROM tx_observations").await,
             kind_count(&events, "tx_received")
         );
         assert_eq!(
-            count(&pool, "SELECT count(*) FROM tx_rejections").await,
+            count(&store, "SELECT count(*) FROM tx_rejections").await,
             kind_count(&events, "tx_rejected")
         );
         assert_eq!(
-            count(&pool, "SELECT count(*) FROM mempool_snapshots").await,
+            count(&store, "SELECT count(*) FROM mempool_snapshots").await,
             kind_count(&events, "mempool_snapshot")
         );
         assert_eq!(
-            count(&pool, "SELECT count(*) FROM proof_attempts").await,
+            count(&store, "SELECT count(*) FROM proof_attempts").await,
             kind_count(&events, "proof_produced")
         );
         // losing proofs are the wasted work
@@ -820,35 +574,27 @@ mod tests {
         assert!(lost > 0, "the fixture should contain losing proofs");
         assert_eq!(
             count(
-                &pool,
+                &store,
                 "SELECT count(*) FROM proof_attempts WHERE won = false"
             )
             .await,
             lost
         );
-        assert_eq!(
-            count(
-                &pool,
-                "SELECT count(*) FROM proof_attempts WHERE started_at IS NULL OR won IS NULL"
-            )
-            .await,
-            0
-        );
+        let unfinished =
+            "SELECT count(*) FROM proof_attempts WHERE started_at IS NULL OR won IS NULL";
+        assert_eq!(count(&store, unfinished).await, 0);
         let blocks: HashSet<&str> = events
             .iter()
             .filter(|e| e.kind.starts_with("block_"))
             .map(|e| e.data["hash"].as_str().unwrap())
             .collect();
         assert_eq!(
-            count(&pool, "SELECT count(*) FROM block_observations").await,
+            count(&store, "SELECT count(*) FROM block_observations").await,
             blocks.len() as i64
         );
+        let orphaned = "SELECT count(*) FROM block_observations WHERE orphaned_at IS NOT NULL";
         assert_eq!(
-            count(
-                &pool,
-                "SELECT count(*) FROM block_observations WHERE orphaned_at IS NOT NULL"
-            )
-            .await,
+            count(&store, orphaned).await,
             kind_count(&events, "block_orphaned")
         );
         assert!(
@@ -858,59 +604,69 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn restart_and_replay_change_nothing(pool: PgPool) {
+    async fn restart_and_replay_change_nothing(pool: sqlx::PgPool) {
+        let store = Store::new(pool);
         let events = read_events(MINER_1).unwrap();
         let n = events.len();
-        let node = MemoryEventNode::new(events.clone());
+        let mut node = MemoryEventNode::new(events.clone());
         let m = Metrics::new();
         let cfg = fast_cfg("miner-1");
 
         // the node has only the first part when we start ...
         node.set_visible(200);
-        ingest_until_caught_up(&pool, &node, &cfg, &m)
+        ingest_until_caught_up(&store, &mut node, &cfg, &m)
             .await
             .unwrap();
-        assert_no_gaps_no_duplicates(&pool, "miner-1", 200).await;
+        assert_no_gaps_no_duplicates(&store, "miner-1", 200).await;
         // ... the indexer "restarts" (state is only in the database) and the node has grown
         node.set_visible(n);
-        ingest_until_caught_up(&pool, &node, &cfg, &m)
+        ingest_until_caught_up(&store, &mut node, &cfg, &m)
             .await
             .unwrap();
-        ingest_until_caught_up(&pool, &node, &cfg, &m)
+        ingest_until_caught_up(&store, &mut node, &cfg, &m)
             .await
             .unwrap();
-        assert_no_gaps_no_duplicates(&pool, "miner-1", n as i64).await;
-        let attempts = count(&pool, "SELECT count(*) FROM proof_attempts").await;
+        assert_no_gaps_no_duplicates(&store, "miner-1", n as i64).await;
+        let attempts = count(&store, "SELECT count(*) FROM proof_attempts").await;
 
         // the same page delivered again (a retry after a lost answer) is harmless
-        store_page(&pool, "miner-1", 0, &events[..50])
+        ingest_page(&store, &id("miner-1"), 0, &events[..50])
             .await
             .unwrap();
-        store_page(&pool, "miner-1", 100, &events[100..160])
+        ingest_page(&store, &id("miner-1"), 100, &events[100..160])
             .await
             .unwrap();
-        assert_no_gaps_no_duplicates(&pool, "miner-1", n as i64).await;
+        assert_no_gaps_no_duplicates(&store, "miner-1", n as i64).await;
         assert_eq!(
-            count(&pool, "SELECT count(*) FROM proof_attempts").await,
+            count(&store, "SELECT count(*) FROM proof_attempts").await,
             attempts
         );
     }
 
     #[sqlx::test]
-    async fn a_page_that_skips_an_event_is_refused(pool: PgPool) {
+    async fn a_page_that_skips_an_event_is_refused(pool: sqlx::PgPool) {
+        let store = Store::new(pool);
         let events = read_events(MINER_1).unwrap();
         let mut holey = events[..10].to_vec();
         holey.remove(4);
-        assert!(store_page(&pool, "miner-1", 0, &holey).await.is_err());
+        assert!(matches!(
+            ingest_page(&store, &id("miner-1"), 0, &holey).await,
+            Err(EventError::Contract(_))
+        ));
         // an event of another node is refused too (wrong address configured)
-        assert!(store_page(&pool, "node-a", 0, &events[..5]).await.is_err());
+        assert!(
+            ingest_page(&store, &id("node-a"), 0, &events[..5])
+                .await
+                .is_err()
+        );
         // nothing was written
-        assert_eq!(count(&pool, "SELECT count(*) FROM node_events").await, 0);
-        assert_eq!(load_cursor(&pool, "miner-1").await.unwrap(), 0);
+        assert_eq!(count(&store, "SELECT count(*) FROM node_events").await, 0);
+        assert_eq!(store.event_cursor(&id("miner-1")).await.unwrap(), 0);
     }
 
     #[sqlx::test]
-    async fn odd_events_are_kept_raw_and_do_not_stop_ingestion(pool: PgPool) {
+    async fn odd_events_are_kept_raw_and_do_not_stop_ingestion(pool: sqlx::PgPool) {
+        let store = Store::new(pool);
         let ev = |seq: u64, kind: &str, data: serde_json::Value| Event {
             seq,
             time: "2026-10-19T14:00:00.000Z".into(),
@@ -927,47 +683,49 @@ mod tests {
             ),
             ev(3, "peer_connected", serde_json::json!({"peer_id": "p"})),
         ];
-        let stats = store_page(&pool, "n", 0, &events).await.unwrap();
+        let stats = ingest_page(&store, &id("n"), 0, &events).await.unwrap();
         assert_eq!(stats, PageStats { stored: 3, bad: 1 });
-        assert_eq!(count(&pool, "SELECT count(*) FROM node_events").await, 3);
+        assert_eq!(count(&store, "SELECT count(*) FROM node_events").await, 3);
         assert_eq!(
-            count(&pool, "SELECT count(*) FROM tx_observations").await,
+            count(&store, "SELECT count(*) FROM tx_observations").await,
             0
         );
-        assert_eq!(load_cursor(&pool, "n").await.unwrap(), 3);
+        assert_eq!(store.event_cursor(&id("n")).await.unwrap(), 3);
     }
 
     #[sqlx::test]
-    async fn events_the_node_dropped_are_recorded_as_a_gap(pool: PgPool) {
+    async fn events_the_node_dropped_are_recorded_as_a_gap(pool: sqlx::PgPool) {
+        let store = Store::new(pool);
         let events = read_events(MINER_1).unwrap();
         let n = events.len() as u64;
-        let node = MemoryEventNode::new(events).with_retention(100);
+        let mut node = MemoryEventNode::new(events).with_retention(100);
         let m = Metrics::new();
-        ingest_until_caught_up(&pool, &node, &fast_cfg("miner-1"), &m)
+        ingest_until_caught_up(&store, &mut node, &fast_cfg("miner-1"), &m)
             .await
             .unwrap();
 
         let oldest = n - 99;
         let gap: (i64, i64) =
             sqlx::query_as("SELECT from_seq, to_seq FROM event_gaps WHERE node_id = 'miner-1'")
-                .fetch_one(&pool)
+                .fetch_one(store.pool())
                 .await
                 .unwrap();
         assert_eq!(gap, (1, oldest as i64 - 1));
-        assert_eq!(count(&pool, "SELECT count(*) FROM node_events").await, 100);
+        assert_eq!(count(&store, "SELECT count(*) FROM node_events").await, 100);
         assert_eq!(
-            count(&pool, "SELECT min(seq) FROM node_events").await,
+            count(&store, "SELECT min(seq) FROM node_events").await,
             oldest as i64
         );
-        assert_eq!(load_cursor(&pool, "miner-1").await.unwrap(), n);
+        assert_eq!(store.event_cursor(&id("miner-1")).await.unwrap(), n);
         assert!(m.render().contains("pouw_indexer_event_gaps_total 1"));
     }
 
     #[sqlx::test]
-    async fn a_dropped_connection_is_retried_and_falls_back_to_polling(pool: PgPool) {
+    async fn a_dropped_connection_is_retried_and_falls_back_to_polling(pool: sqlx::PgPool) {
+        let store = Store::new(pool);
         let events = read_events(MINER_1).unwrap();
         let n = events.len() as i64;
-        let node = MemoryEventNode::new(events);
+        let mut node = MemoryEventNode::new(events);
         node.fail_next(4); // four failed requests in a row, then the connection works again
         let m = Arc::new(Metrics::new());
         // never go back to long polling in this test, so the mode can be checked at the end
@@ -976,15 +734,15 @@ mod tests {
             ..fast_cfg("miner-1")
         };
 
-        let task = tokio::spawn(run(pool.clone(), node, cfg, m.clone()));
+        let task = tokio::spawn(run(store.clone(), node, cfg, m.clone()));
         let deadline = Instant::now() + Duration::from_secs(15);
-        while load_cursor(&pool, "miner-1").await.unwrap() as i64 != n {
+        while store.event_cursor(&id("miner-1")).await.unwrap() as i64 != n {
             assert!(Instant::now() < deadline, "the loop did not recover");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         task.abort();
 
-        assert_no_gaps_no_duplicates(&pool, "miner-1", n).await;
+        assert_no_gaps_no_duplicates(&store, "miner-1", n).await;
         let text = m.render();
         assert!(
             text.contains("pouw_indexer_event_source_errors_total 4"),
@@ -1005,12 +763,12 @@ mod tests {
             routing::get,
         };
         async fn handler(
-            State(node): State<MemoryEventNode>,
+            State(node): State<Arc<MemoryEventNode>>,
             Query(q): Query<HashMap<String, u64>>,
         ) -> (StatusCode, Json<serde_json::Value>) {
             let after = q.get("after").copied().unwrap_or(0);
-            let limit = q.get("limit").copied().unwrap_or(100) as u32;
-            match node.fetch(after, limit, 0).await {
+            let limit = u32::try_from(q.get("limit").copied().unwrap_or(100)).unwrap_or(1000);
+            match node.window(after, limit) {
                 Ok(page) => (StatusCode::OK, Json(serde_json::to_value(page).unwrap())),
                 Err(FetchError::CursorExpired { oldest_seq }) => (
                     StatusCode::GONE,
@@ -1018,7 +776,7 @@ mod tests {
                         "message": format!("oldest available seq is {oldest_seq}"),
                         "details": {"oldest_seq": oldest_seq}}})),
                 ),
-                Err(FetchError::Other(_)) => (
+                Err(FetchError::Node(_)) => (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({})),
                 ),
@@ -1026,7 +784,7 @@ mod tests {
         }
         let app = Router::new()
             .route("/v1/events", get(handler))
-            .with_state(node);
+            .with_state(Arc::new(node));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -1034,11 +792,12 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn the_http_client_reads_pages_and_reports_outages(pool: PgPool) {
+    async fn the_http_client_reads_pages_and_reports_outages(pool: sqlx::PgPool) {
+        let store = Store::new(pool);
         let events = read_events(MINER_1).unwrap();
         let n = events.len() as i64;
         let url = serve(MemoryEventNode::new(events.clone())).await;
-        let src = HttpEventSource::new(&url).unwrap();
+        let mut src = HttpEventSource::new(&url).unwrap();
 
         // pages continue where the cursor is
         let first = src.fetch(0, 5, 0).await.unwrap();
@@ -1047,10 +806,10 @@ mod tests {
         assert_eq!(second.events[0].seq, 6);
         // and it all ends up in the database through the HTTP client
         let m = Metrics::new();
-        ingest_until_caught_up(&pool, &src, &fast_cfg("miner-1"), &m)
+        ingest_until_caught_up(&store, &mut src, &fast_cfg("miner-1"), &m)
             .await
             .unwrap();
-        assert_no_gaps_no_duplicates(&pool, "miner-1", n).await;
+        assert_no_gaps_no_duplicates(&store, "miner-1", n).await;
 
         // 410 becomes CursorExpired with the oldest seq
         let old_url = serve(MemoryEventNode::new(events).with_retention(50)).await;
@@ -1070,19 +829,15 @@ mod tests {
         }; // the listener is dropped here, nothing listens on that port any more
         assert!(matches!(
             HttpEventSource::new(&dead).unwrap().fetch(0, 10, 0).await,
-            Err(FetchError::Other(_))
+            Err(FetchError::Node(NodeError::Request(_)))
         ));
     }
-}
-
-#[cfg(test)]
-mod node_format_tests {
-    use super::*;
 
     /// Events as the node's own types write them (pouw-api, event.rs): block events carry `id`,
     /// and `block_accepted` has no bucket fields.
     #[sqlx::test]
-    async fn events_in_the_nodes_own_format_are_understood(pool: PgPool) {
+    async fn events_in_the_nodes_own_format_are_understood(pool: sqlx::PgPool) {
+        let store = Store::new(pool);
         let blk = format!("blk:{}", "ab".repeat(32));
         let miner = format!("addr:{}", "cd".repeat(32));
         let ev = |seq: u64, kind: &str, data: serde_json::Value| Event {
@@ -1114,14 +869,15 @@ mod node_format_tests {
                 serde_json::json!({"id": blk, "height": 7}),
             ),
         ];
-        let stats = store_page(&pool, "node-1", 0, &events).await.unwrap();
+        let stats = ingest_page(&store, &id("node-1"), 0, &events)
+            .await
+            .unwrap();
         assert_eq!(stats, PageStats { stored: 4, bad: 0 });
-        let row: (i64, bool, bool) = sqlx::query_as(
-            "SELECT height, accepted_at IS NOT NULL, orphaned_at IS NOT NULL FROM block_observations",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let row: (i64, bool, bool) =
+            sqlx::query_as("SELECT height, accepted_at IS NOT NULL, orphaned_at IS NOT NULL FROM block_observations")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
         assert_eq!(row, (7, true, true));
     }
 }

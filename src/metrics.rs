@@ -14,6 +14,8 @@ pub struct Metrics {
     pub reorgs: IntCounter,
     pub last_reorg_depth: IntGauge,
     pub node_errors: IntCounter,
+    pub store_errors: IntCounter,
+    pub accounts_copied: IntCounter,
     pub batch_seconds: Histogram,
     pub events_ingested: IntCounter,
     pub events_unparsed: IntCounter,
@@ -93,7 +95,18 @@ impl Metrics {
                 "pouw_indexer_last_reorg_depth",
                 "Blocks dropped by the last reorganisation",
             ),
-            node_errors: counter("pouw_indexer_node_errors_total", "Failed sync attempts"),
+            node_errors: counter(
+                "pouw_indexer_node_errors_total",
+                "Sync rounds that failed because of the node",
+            ),
+            store_errors: counter(
+                "pouw_indexer_store_errors_total",
+                "Rounds that failed because of the database",
+            ),
+            accounts_copied: counter(
+                "pouw_indexer_accounts_copied_total",
+                "Accounts copied from the node",
+            ),
             batch_seconds,
             registry,
         }
